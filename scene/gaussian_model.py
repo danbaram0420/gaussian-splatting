@@ -21,6 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from pytorch3d.transforms import quaternion_to_matrix
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -64,6 +65,8 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self._normals = None  # oriented normals (lazy)
+        self._normals_mask = torch.empty(0)  # +1/-1 vote accumulator
 
     def capture(self):
         return (
@@ -132,6 +135,43 @@ class GaussianModel:
     @property
     def get_exposure(self):
         return self._exposure
+
+    def get_rotation_matrix(self):
+        """(N,3,3) 회전 행렬 반환"""
+        return quaternion_to_matrix(self.get_rotation)
+
+    def get_smallest_axis(self, return_idx: bool = False):
+        """
+        가우시안 공분산 축 중 가장 짧은 축 = 표면 법선 후보.
+        """
+        rot = self.get_rotation_matrix()  # (N,3,3)
+        idx = self.get_scaling.min(dim=-1)[1][..., None]  # (N,1)
+        idx = idx[:, None].expand(-1, 3, -1)  # (N,3,1)
+        axis = rot.gather(2, idx).squeeze(2)  # (N,3)
+        return (axis, idx[..., 0, 0]) if return_idx else axis
+
+    def get_normal(self, view_cam):
+        normal_global = self.get_smallest_axis()
+        dir2cam = view_cam.camera_center - self._xyz
+        flip = (normal_global * dir2cam).sum(-1) < 0
+        normal_global[flip] = -normal_global[flip]
+        return normal_global
+
+    def get_correct_normal(self, normals_cam, mask):
+        """
+        렌더러가 per-pixel 법선과 ‘해당 픽셀에 투영된 가우시안 인덱스’ mask를
+        넘겨주면, 우리 쪽 mask(+1/-1 누적)에 투표하여 뒤집힘 상태를 집계.
+        """
+        ref_n = self.get_smallest_axis()[mask]  # (M,3)
+        got_n = normals_cam[mask]  # (M,3)
+        same = (ref_n * got_n).sum(-1) > 0  # boolean
+        self._normals_mask[mask] += (same.float() * 2 - 1)
+        # 음성 샘플도 살짝 반영(수렴 가속용, 크게 중요치 않음)
+        ref_o = self.get_smallest_axis()[~mask]
+        got_o = normals_cam[~mask]
+        opp = (ref_o * got_o).sum(-1) < 0
+        self._normals_mask[~mask] += 0.0001 * (opp.float() * 2 - 1)
+
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
@@ -236,11 +276,17 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, orient_normals=False):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
+        if orient_normals:
+            self._normals_mask[self._normals_mask > 0] = 1
+            self._normals_mask[self._normals_mask < 0] = -1
+            self._normals = self.get_smallest_axis() * self._normals_mask.unsqueeze(1)
+            normals = self._normals.detach().cpu().numpy()
+        else:
+            normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
@@ -310,6 +356,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._normals_mask = torch.zeros(len(xyz), dtype=torch.float, device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 

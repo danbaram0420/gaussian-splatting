@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, correct_norml: bool = False):
     """
     Render the scene. 
     
@@ -45,8 +45,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        debug=getattr(pipe, "debug", False)
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -88,7 +87,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
+        rendered_image, radii = rasterizer(
             means3D = means3D,
             means2D = means2D,
             dc = dc,
@@ -99,7 +98,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     else:
-        rendered_image, radii, depth_image = rasterizer(
+        rendered_image, radii = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -108,6 +107,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+
+    if correct_norml:
+        visible = radii > 0
+        global_normal = pc.get_normal(viewpoint_camera)  # (N,3)
+        pc.get_correct_normal(global_normal, visible)
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
@@ -121,8 +125,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "render": rendered_image,
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
-        "radii": radii,
-        "depth" : depth_image
+        "radii": radii
         }
     
     return out
